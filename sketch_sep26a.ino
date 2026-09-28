@@ -6,7 +6,7 @@
 
 // ---------- WiFi CONFIG ----------
 const char* WIFI_SSID     = "Wazir";
-const char* WIFI_PASSWORD = "wazir@1420";
+const char* WIFI_PASSWORD = "wazir@1420";   // <-- naya password yahan likhein
 
 // ---------- FIREBASE CONFIG ----------
 const char* FIREBASE_DB_URL = "https://finalyearproject-2034b-default-rtdb.asia-southeast1.firebasedatabase.app";
@@ -17,39 +17,42 @@ const char* METER_NAME = "ABB B24";
 
 // ---------- Meter CONFIG ----------
 #define METER_SLAVE_ID     10
-#define MODBUS_BAUDRATE     19200
+#define MODBUS_BAUDRATE    19200
 
 // ---------- Pin definitions ----------
-#define RS485_DE_RE_PIN     4
-#define RXD2                16
-#define TXD2                17
+#define RS485_DE_RE_PIN    4
+#define RXD2               16
+#define TXD2               17
 
 ModbusMaster node;
-
-// Ek hi dafa banate hain — baar baar naya client banane se memory
-// fragment hoti hai aur ESP32 crash/reboot ho sakta hai
 WiFiClientSecure secureClient;
 
 unsigned long lastReadTime = 0;
-const unsigned long READ_INTERVAL_MS = 2000; // har 2 second 'latest' update
+const unsigned long READ_INTERVAL_MS = 2000;      // har 2 sec 'latest'
 
 unsigned long lastHistoryWriteTime = 0;
-// History ko 2-second resolution ki zaroorat nahi (sirf daily total chahiye),
-// isliye isay kam baar likhte hain — har cycle mein 1 extra HTTPS request
-// hatane se 'latest' zyada consistently, bina lambe gap ke, update hoti hai
-// (jo "Meter Offline" flicker ka masla fix karta hai).
-const unsigned long HISTORY_INTERVAL_MS = 30000; // har 30 second
+const unsigned long HISTORY_INTERVAL_MS = 60000;  // har 60 sec 'history'
 
+// Pichli sahi values (agar koi read fail ho to yehi bhejte hain)
+float lastCurrent = 0, lastPower = 0, lastFreq = 50.0, lastPF = 0, lastEnergy = 0;
+
+// ---------- RS485 direction control ----------
 void preTransmission() {
   digitalWrite(RS485_DE_RE_PIN, HIGH);
+  delayMicroseconds(100);
 }
 
 void postTransmission() {
+  Serial2.flush();               // aakhri byte nikalne tak ruko
+  delayMicroseconds(100);
   digitalWrite(RS485_DE_RE_PIN, LOW);
 }
 
+// ---------- WiFi + Time ----------
 void connectWiFi() {
   Serial.print("WiFi se connect ho raha hai");
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -60,8 +63,7 @@ void connectWiFi() {
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
 
-  // NTP se real calendar time set karte hain (Pakistan = UTC+5)
-  configTime(5 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+  configTime(5 * 3600, 0, "pool.ntp.org", "time.nist.gov");   // Pakistan UTC+5
   Serial.print("Time sync ho raha hai");
   time_t now = time(nullptr);
   while (now < 100000) {
@@ -73,7 +75,6 @@ void connectWiFi() {
   Serial.println("Time synced!");
 }
 
-// Aaj ki date "YYYY-MM-DD" format mein deta hai, Firebase history key ke liye
 String getTodayDateString() {
   time_t now = time(nullptr);
   struct tm timeinfo;
@@ -84,85 +85,92 @@ String getTodayDateString() {
   return String(buf);
 }
 
-// Voltage, Current, Power jaisi 32-bit (2-register) values ke liye
+// ---------- Modbus reads (har ek 3 baar retry karta hai) ----------
 uint32_t read32(uint16_t startReg) {
-  uint8_t result = node.readHoldingRegisters(startReg, 2);
-  if (result == node.ku8MBSuccess) {
-    uint32_t high = node.getResponseBuffer(0);
-    uint32_t low  = node.getResponseBuffer(1);
-    return (high << 16) | low;
+  for (int i = 1; i <= 3; i++) {
+    uint8_t result = node.readHoldingRegisters(startReg, 2);
+    if (result == node.ku8MBSuccess) {
+      uint32_t high = node.getResponseBuffer(0);
+      uint32_t low  = node.getResponseBuffer(1);
+      return (high << 16) | low;
+    }
+    Serial.printf("Modbus fail reg 0x%X err 0x%X (try %d)\n", startReg, result, i);
+    delay(100);
   }
-  Serial.print("Modbus read failed at reg 0x");
-  Serial.print(startReg, HEX);
-  Serial.print(" - error: ");
-  Serial.println(result, HEX);
   return 0xFFFFFFFF;
 }
 
-// Frequency aur Power Factor jaisi 16-bit (1-register) values ke liye
 int32_t read16(uint16_t reg, bool &ok) {
-  uint8_t result = node.readHoldingRegisters(reg, 1);
-  if (result == node.ku8MBSuccess) {
-    ok = true;
-    return (int16_t)node.getResponseBuffer(0);
+  for (int i = 1; i <= 3; i++) {
+    uint8_t result = node.readHoldingRegisters(reg, 1);
+    if (result == node.ku8MBSuccess) {
+      ok = true;
+      return (int16_t)node.getResponseBuffer(0);
+    }
+    Serial.printf("Modbus fail reg 0x%X err 0x%X (try %d)\n", reg, result, i);
+    delay(100);
   }
-  Serial.print("Modbus read failed at reg 0x");
-  Serial.print(reg, HEX);
-  Serial.print(" - error: ");
-  Serial.println(result, HEX);
   ok = false;
   return 0;
 }
 
-// Resettable Energy counter jaisi 64-bit (4-register) values ke liye
 uint64_t read64(uint16_t startReg, bool &ok) {
-  uint8_t result = node.readHoldingRegisters(startReg, 4);
-  if (result == node.ku8MBSuccess) {
-    ok = true;
-    uint64_t r0 = node.getResponseBuffer(0);
-    uint64_t r1 = node.getResponseBuffer(1);
-    uint64_t r2 = node.getResponseBuffer(2);
-    uint64_t r3 = node.getResponseBuffer(3);
-    return (r0 << 48) | (r1 << 32) | (r2 << 16) | r3;
+  for (int i = 1; i <= 3; i++) {
+    uint8_t result = node.readHoldingRegisters(startReg, 4);
+    if (result == node.ku8MBSuccess) {
+      ok = true;
+      uint64_t r0 = node.getResponseBuffer(0);
+      uint64_t r1 = node.getResponseBuffer(1);
+      uint64_t r2 = node.getResponseBuffer(2);
+      uint64_t r3 = node.getResponseBuffer(3);
+      return (r0 << 48) | (r1 << 32) | (r2 << 16) | r3;
+    }
+    Serial.printf("Modbus fail reg 0x%X err 0x%X (try %d)\n", startReg, result, i);
+    delay(100);
   }
-  Serial.print("Modbus read failed at reg 0x");
-  Serial.print(startReg, HEX);
-  Serial.print(" - error: ");
-  Serial.println(result, HEX);
   ok = false;
   return 0;
 }
 
-// Meter ka naam Firebase mein ek hi baar bhej deta hai (setup() se call hota hai)
-void sendMeterName() {
-  if (WiFi.status() != WL_CONNECTED) return;
+// ---------- Firebase helper: fresh socket + retry ----------
+bool firebasePut(const String& url, const String& body, const char* tag, int maxAttempts) {
+  for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (WiFi.status() != WL_CONNECTED) return false;
 
-  HTTPClient http;
-  String url = String(FIREBASE_DB_URL) + "/meters/" + METER_ID + "/name.json";
-  http.begin(secureClient, url);
-  http.addHeader("Content-Type", "application/json");
+    secureClient.stop();            // purana/stale socket band karo
+    HTTPClient http;
+    http.setReuse(false);           // Connection: close
+    http.setConnectTimeout(3000);
+    http.setTimeout(4000);
 
-  String json = "\"" + String(METER_NAME) + "\"";
-  int httpCode = http.PUT(json);
+    if (!http.begin(secureClient, url)) {
+      delay(300);
+      continue;
+    }
+    http.addHeader("Content-Type", "application/json");
+    int code = http.PUT(body);
+    http.end();
 
-  if (httpCode > 0) {
-    Serial.print("Meter name set, response code: ");
-    Serial.println(httpCode);
-  } else {
-    Serial.print("Meter name send failed: ");
-    Serial.println(http.errorToString(httpCode));
+    if (code == 200) {
+      Serial.printf("Firebase (%s) updated, response code: 200\n", tag);
+      return true;
+    }
+    Serial.printf("Firebase (%s) attempt %d failed: %d (%s) heap=%u\n",
+                  tag, attempt, code, HTTPClient::errorToString(code).c_str(),
+                  ESP.getFreeHeap());
+    delay(300 * attempt);
   }
-  http.end();
+  return false;
 }
 
-// Firebase ko sirf 'latest' reading bhejta hai (har cycle, tez rehne ke liye)
-void sendLatestToFirebase(float voltage, float current, float powerW, float frequency, float powerFactor, float energyKwh) {
-  if (WiFi.status() != WL_CONNECTED) return;
+void sendMeterName() {
+  String url = String(FIREBASE_DB_URL) + "/meters/" + METER_ID + "/name.json";
+  String json = "\"" + String(METER_NAME) + "\"";
+  firebasePut(url, json, "name", 3);
+}
 
-  HTTPClient http;
+void sendLatestToFirebase(float voltage, float current, float powerW, float frequency, float powerFactor, float energyKwh) {
   String url = String(FIREBASE_DB_URL) + "/meters/" + METER_ID + "/latest.json";
-  http.begin(secureClient, url);
-  http.addHeader("Content-Type", "application/json");
 
   String json = "{";
   json += "\"voltage\":" + String(voltage, 1) + ",";
@@ -174,54 +182,42 @@ void sendLatestToFirebase(float voltage, float current, float powerW, float freq
   json += "\"timestamp\":{\".sv\":\"timestamp\"}";
   json += "}";
 
-  int httpCode = http.PUT(json);
-  if (httpCode > 0) {
-    Serial.print("Firebase (latest) updated, response code: ");
-    Serial.println(httpCode);
-  } else {
-    Serial.print("Firebase (latest) send failed: ");
-    Serial.println(http.errorToString(httpCode));
-  }
-  http.end();
+  firebasePut(url, json, "latest", 2);
 }
 
-// History ko alag se, kam baar (har 30 sec) likhta hai
 void sendHistoryToFirebase(float energyKwh) {
-  if (WiFi.status() != WL_CONNECTED) return;
-
   String dateKey = getTodayDateString();
-  String historyUrl = String(FIREBASE_DB_URL) + "/meters/" + METER_ID + "/history/" + dateKey + ".json";
-  HTTPClient http2;
-  http2.begin(secureClient, historyUrl);
-  http2.addHeader("Content-Type", "application/json");
-  int code = http2.PUT(String(energyKwh, 2));
-  Serial.print("Firebase (history) updated, response code: ");
-  Serial.println(code);
-  http2.end();
+  String url = String(FIREBASE_DB_URL) + "/meters/" + METER_ID + "/history/" + dateKey + ".json";
+  firebasePut(url, String(energyKwh, 2), "history", 3);
 }
 
+// ---------- Main read + send ----------
 void updateAndSendReadings() {
-  const uint16_t REG_VOLTAGE_L1     = 0x5B00;
-  const uint16_t REG_CURRENT_L1     = 0x5B0C;
-  const uint16_t REG_POWER_TOTAL    = 0x5B14;
-  const uint16_t REG_FREQUENCY      = 0x5B2C; // 16-bit, unsigned, x0.01
-  const uint16_t REG_POWER_FACTOR   = 0x5B3A; // 16-bit, signed,   x0.001
-  const uint16_t REG_RESETTABLE_ENERGY = 0x552C; // 64-bit, unsigned, x0.01 kWh
+  const uint16_t REG_VOLTAGE_L1        = 0x5B00;
+  const uint16_t REG_CURRENT_L1        = 0x5B0C;
+  const uint16_t REG_POWER_TOTAL       = 0x5B14;
+  const uint16_t REG_FREQUENCY         = 0x5B2C; // 16-bit, x0.01
+  const uint16_t REG_POWER_FACTOR      = 0x5B3A; // 16-bit signed, x0.001
+  const uint16_t REG_RESETTABLE_ENERGY = 0x552C; // 64-bit, x0.01 kWh
 
   uint32_t rawVoltage = read32(REG_VOLTAGE_L1);
 
-  // Agar meter se voltage hi na mile, to matlab meter off/disconnected hai —
-  // Firebase ko bilkul update na karein, taake purana timestamp wahi rahe
-  // aur app khud "Offline" detect kar le.
+  // Voltage hi na mile => meter off/disconnected, Firebase update skip
   if (rawVoltage == 0xFFFFFFFF) {
-    Serial.println("Meter se koi jawab nahi mila — Firebase update skip kar rahe hain");
+    Serial.println("Meter se koi jawab nahi mila - Firebase update skip");
+    return;
+  }
+
+  float voltage = rawVoltage * 0.1;
+  if (voltage < 150 || voltage > 300) {
+    Serial.printf("Voltage ghalat lag rahi hai (%.1f), skip\n", voltage);
     return;
   }
 
   delay(150);
   uint32_t rawCurrent = read32(REG_CURRENT_L1);
   delay(150);
-  uint32_t rawPower   = read32(REG_POWER_TOTAL);
+  uint32_t rawPower = read32(REG_POWER_TOTAL);
   delay(150);
 
   bool freqOk = false, pfOk = false, energyOk = false;
@@ -231,33 +227,35 @@ void updateAndSendReadings() {
   delay(150);
   uint64_t rawEnergy = read64(REG_RESETTABLE_ENERGY, energyOk);
 
-  float voltage      = rawVoltage * 0.1;
-  float current       = (rawCurrent != 0xFFFFFFFF) ? rawCurrent * 0.01 : 0;
-  float powerW        = (rawPower   != 0xFFFFFFFF) ? ((int32_t)rawPower) * 0.01 : 0;
-  float frequency      = freqOk ? rawFrequency * 0.01f  : 0;
-  float powerFactor   = pfOk   ? rawPowerFactor * 0.001f : 0;
-  float energyKwh     = energyOk ? (double)rawEnergy * 0.01 : 0;
+  // Sirf sahi reads se last-good values update karo
+  if (rawCurrent != 0xFFFFFFFF) lastCurrent = rawCurrent * 0.01;
+  if (rawPower   != 0xFFFFFFFF) lastPower   = ((int32_t)rawPower) * 0.01;
+  if (freqOk) {
+    float f = rawFrequency * 0.01f;
+    if (f > 45 && f < 55) lastFreq = f;
+  }
+  if (pfOk && abs(rawPowerFactor) <= 1000) lastPF = rawPowerFactor * 0.001f;
+  if (energyOk) lastEnergy = (double)rawEnergy * 0.01;
 
   Serial.printf("[%s] V=%.1f  I=%.2f  P=%.2fW  Hz=%.2f  PF=%.3f  E=%.2fkWh\n",
-                METER_ID, voltage, current, powerW, frequency, powerFactor, energyKwh);
+                METER_ID, voltage, lastCurrent, lastPower, lastFreq, lastPF, lastEnergy);
 
-  // 'latest' har cycle update hoti hai (tez, sirf 1 request)
-  sendLatestToFirebase(voltage, current, powerW, frequency, powerFactor, energyKwh);
+  sendLatestToFirebase(voltage, lastCurrent, lastPower, lastFreq, lastPF, lastEnergy);
 
-  // 'history' sirf har HISTORY_INTERVAL_MS baad likhte hain
   if (millis() - lastHistoryWriteTime >= HISTORY_INTERVAL_MS) {
     lastHistoryWriteTime = millis();
-    sendHistoryToFirebase(energyKwh);
+    sendHistoryToFirebase(lastEnergy);
   }
 }
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
+  Serial.printf("Reset reason: %d\n", (int)esp_reset_reason());
 
   connectWiFi();
 
-  secureClient.setInsecure(); // FYP/prototype ke liye theek hai, production mein certificate use karein
+  secureClient.setInsecure();   // prototype ke liye theek, production mein certificate use karein
   sendMeterName();
 
   Serial2.begin(MODBUS_BAUDRATE, SERIAL_8E1, RXD2, TXD2);
