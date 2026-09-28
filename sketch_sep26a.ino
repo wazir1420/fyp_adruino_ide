@@ -6,7 +6,7 @@
 
 // ---------- WiFi CONFIG ----------
 const char* WIFI_SSID     = "Wazir";
-const char* WIFI_PASSWORD = "wazir@1420";   // <-- naya password yahan likhein
+const char* WIFI_PASSWORD = "wazir@1420";
 
 // ---------- FIREBASE CONFIG ----------
 const char* FIREBASE_DB_URL = "https://finalyearproject-2034b-default-rtdb.asia-southeast1.firebasedatabase.app";
@@ -27,14 +27,43 @@ const char* METER_NAME = "ABB B24";
 ModbusMaster node;
 WiFiClientSecure secureClient;
 
+// ---------- Print queue (garbage fix) ----------
+QueueHandle_t printQueue = NULL;
+
 unsigned long lastReadTime = 0;
-const unsigned long READ_INTERVAL_MS = 2000;      // har 2 sec 'latest'
+const unsigned long READ_INTERVAL_MS = 2000;
 
 unsigned long lastHistoryWriteTime = 0;
-const unsigned long HISTORY_INTERVAL_MS = 60000;  // har 60 sec 'history'
+const unsigned long HISTORY_INTERVAL_MS = 60000;
 
-// Pichli sahi values (agar koi read fail ho to yehi bhejte hain)
+// Last-good values
 float lastCurrent = 0, lastPower = 0, lastFreq = 50.0, lastPF = 0, lastEnergy = 0;
+
+// ---------- Print task: runs on Core 0, isolated from Modbus ----------
+void printTask(void *pvParameters) {
+  char* msg;
+  for (;;) {
+    if (xQueueReceive(printQueue, &msg, portMAX_DELAY) == pdTRUE) {
+      Serial.print(msg);
+      Serial.flush();
+      free(msg);
+    }
+  }
+}
+
+// ---------- safePrintf: queues the message instead of printing directly ----------
+void safePrintf(const char* fmt, ...) {
+  if (printQueue == NULL) return;
+  char* buf = (char*)malloc(256);
+  if (!buf) return;
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, 256, fmt, args);
+  va_end(args);
+  if (xQueueSend(printQueue, &buf, 0) != pdTRUE) {
+    free(buf);   // queue full, drop the message
+  }
+}
 
 // ---------- RS485 direction control ----------
 void preTransmission() {
@@ -43,14 +72,18 @@ void preTransmission() {
 }
 
 void postTransmission() {
-  Serial2.flush();               // aakhri byte nikalne tak ruko
+  // Bounded flush so we never block forever on Serial2
+  unsigned long t = millis();
+  while (Serial2.availableForWrite() < 64 && (millis() - t) < 50) {
+    // wait max 50ms
+  }
   delayMicroseconds(100);
   digitalWrite(RS485_DE_RE_PIN, LOW);
 }
 
 // ---------- WiFi + Time ----------
 void connectWiFi() {
-  Serial.print("WiFi se connect ho raha hai");
+  safePrintf("WiFi se connect ho raha hai");
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -63,7 +96,7 @@ void connectWiFi() {
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
 
-  configTime(5 * 3600, 0, "pool.ntp.org", "time.nist.gov");   // Pakistan UTC+5
+  configTime(5 * 3600, 0, "pool.ntp.org", "time.nist.gov");
   Serial.print("Time sync ho raha hai");
   time_t now = time(nullptr);
   while (now < 100000) {
@@ -85,7 +118,7 @@ String getTodayDateString() {
   return String(buf);
 }
 
-// ---------- Modbus reads (har ek 3 baar retry karta hai) ----------
+// ---------- Modbus reads (3 retries each) ----------
 uint32_t read32(uint16_t startReg) {
   for (int i = 1; i <= 3; i++) {
     uint8_t result = node.readHoldingRegisters(startReg, 2);
@@ -94,7 +127,7 @@ uint32_t read32(uint16_t startReg) {
       uint32_t low  = node.getResponseBuffer(1);
       return (high << 16) | low;
     }
-    Serial.printf("Modbus fail reg 0x%X err 0x%X (try %d)\n", startReg, result, i);
+    safePrintf("Modbus fail reg 0x%X err 0x%X (try %d)\n", startReg, result, i);
     delay(100);
   }
   return 0xFFFFFFFF;
@@ -107,7 +140,7 @@ int32_t read16(uint16_t reg, bool &ok) {
       ok = true;
       return (int16_t)node.getResponseBuffer(0);
     }
-    Serial.printf("Modbus fail reg 0x%X err 0x%X (try %d)\n", reg, result, i);
+    safePrintf("Modbus fail reg 0x%X err 0x%X (try %d)\n", reg, result, i);
     delay(100);
   }
   ok = false;
@@ -125,21 +158,21 @@ uint64_t read64(uint16_t startReg, bool &ok) {
       uint64_t r3 = node.getResponseBuffer(3);
       return (r0 << 48) | (r1 << 32) | (r2 << 16) | r3;
     }
-    Serial.printf("Modbus fail reg 0x%X err 0x%X (try %d)\n", startReg, result, i);
+    safePrintf("Modbus fail reg 0x%X err 0x%X (try %d)\n", startReg, result, i);
     delay(100);
   }
   ok = false;
   return 0;
 }
 
-// ---------- Firebase helper: fresh socket + retry ----------
+// ---------- Firebase helper ----------
 bool firebasePut(const String& url, const String& body, const char* tag, int maxAttempts) {
   for (int attempt = 1; attempt <= maxAttempts; attempt++) {
     if (WiFi.status() != WL_CONNECTED) return false;
 
-    secureClient.stop();            // purana/stale socket band karo
+    secureClient.stop();
     HTTPClient http;
-    http.setReuse(false);           // Connection: close
+    http.setReuse(false);
     http.setConnectTimeout(3000);
     http.setTimeout(4000);
 
@@ -152,12 +185,12 @@ bool firebasePut(const String& url, const String& body, const char* tag, int max
     http.end();
 
     if (code == 200) {
-      Serial.printf("Firebase (%s) updated, response code: 200\n", tag);
+      safePrintf("Firebase (%s) updated, response code: 200\n", tag);
       return true;
     }
-    Serial.printf("Firebase (%s) attempt %d failed: %d (%s) heap=%u\n",
-                  tag, attempt, code, HTTPClient::errorToString(code).c_str(),
-                  ESP.getFreeHeap());
+    safePrintf("Firebase (%s) attempt %d failed: %d (%s) heap=%u\n",
+               tag, attempt, code, HTTPClient::errorToString(code).c_str(),
+               ESP.getFreeHeap());
     delay(300 * attempt);
   }
   return false;
@@ -169,7 +202,8 @@ void sendMeterName() {
   firebasePut(url, json, "name", 3);
 }
 
-void sendLatestToFirebase(float voltage, float current, float powerW, float frequency, float powerFactor, float energyKwh) {
+void sendLatestToFirebase(float voltage, float current, float powerW,
+                          float frequency, float powerFactor, float energyKwh) {
   String url = String(FIREBASE_DB_URL) + "/meters/" + METER_ID + "/latest.json";
 
   String json = "{";
@@ -191,26 +225,25 @@ void sendHistoryToFirebase(float energyKwh) {
   firebasePut(url, String(energyKwh, 2), "history", 3);
 }
 
-// ---------- Main read + send ----------
+// ---------- Main read + send (original delays preserved) ----------
 void updateAndSendReadings() {
   const uint16_t REG_VOLTAGE_L1        = 0x5B00;
   const uint16_t REG_CURRENT_L1        = 0x5B0C;
   const uint16_t REG_POWER_TOTAL       = 0x5B14;
-  const uint16_t REG_FREQUENCY         = 0x5B2C; // 16-bit, x0.01
-  const uint16_t REG_POWER_FACTOR      = 0x5B3A; // 16-bit signed, x0.001
-  const uint16_t REG_RESETTABLE_ENERGY = 0x552C; // 64-bit, x0.01 kWh
+  const uint16_t REG_FREQUENCY         = 0x5B2C;
+  const uint16_t REG_POWER_FACTOR      = 0x5B3A;
+  const uint16_t REG_RESETTABLE_ENERGY = 0x552C;
 
   uint32_t rawVoltage = read32(REG_VOLTAGE_L1);
 
-  // Voltage hi na mile => meter off/disconnected, Firebase update skip
   if (rawVoltage == 0xFFFFFFFF) {
-    Serial.println("Meter se koi jawab nahi mila - Firebase update skip");
+    safePrintf("Meter se koi jawab nahi mila - Firebase update skip\n");
     return;
   }
 
   float voltage = rawVoltage * 0.1;
   if (voltage < 150 || voltage > 300) {
-    Serial.printf("Voltage ghalat lag rahi hai (%.1f), skip\n", voltage);
+    safePrintf("Voltage ghalat lag rahi hai (%.1f), skip\n", voltage);
     return;
   }
 
@@ -225,9 +258,8 @@ void updateAndSendReadings() {
   delay(150);
   int32_t rawPowerFactor = read16(REG_POWER_FACTOR, pfOk);
   delay(150);
-  uint64_t rawEnergy = read64(REG_RESETTABLE_ENERGY, energyOk);
+  uint64_t rawEnergy     = read64(REG_RESETTABLE_ENERGY, energyOk);
 
-  // Sirf sahi reads se last-good values update karo
   if (rawCurrent != 0xFFFFFFFF) lastCurrent = rawCurrent * 0.01;
   if (rawPower   != 0xFFFFFFFF) lastPower   = ((int32_t)rawPower) * 0.01;
   if (freqOk) {
@@ -237,8 +269,8 @@ void updateAndSendReadings() {
   if (pfOk && abs(rawPowerFactor) <= 1000) lastPF = rawPowerFactor * 0.001f;
   if (energyOk) lastEnergy = (double)rawEnergy * 0.01;
 
-  Serial.printf("[%s] V=%.1f  I=%.2f  P=%.2fW  Hz=%.2f  PF=%.3f  E=%.2fkWh\n",
-                METER_ID, voltage, lastCurrent, lastPower, lastFreq, lastPF, lastEnergy);
+  safePrintf("[%s] V=%.1f  I=%.2f  P=%.2fW  Hz=%.2f  PF=%.3f  E=%.2fkWh\n",
+             METER_ID, voltage, lastCurrent, lastPower, lastFreq, lastPF, lastEnergy);
 
   sendLatestToFirebase(voltage, lastCurrent, lastPower, lastFreq, lastPF, lastEnergy);
 
@@ -248,14 +280,21 @@ void updateAndSendReadings() {
   }
 }
 
+// ---------- Setup ----------
 void setup() {
   Serial.begin(115200);
   delay(1000);
+
+  // ---- Print queue + PrintTask on Core 0 (fixes garbage) ----
+  printQueue = xQueueCreate(30, sizeof(char*));
+  xTaskCreatePinnedToCore(printTask, "PrintTask", 4096, NULL, 1, NULL, 0);
+
   Serial.printf("Reset reason: %d\n", (int)esp_reset_reason());
+  Serial.flush();
 
   connectWiFi();
 
-  secureClient.setInsecure();   // prototype ke liye theek, production mein certificate use karein
+  secureClient.setInsecure();
   sendMeterName();
 
   Serial2.begin(MODBUS_BAUDRATE, SERIAL_8E1, RXD2, TXD2);
@@ -267,11 +306,13 @@ void setup() {
   node.postTransmission(postTransmission);
 
   Serial.println("Setup complete. Meter data Firebase ko bhejna shuru...");
+  Serial.flush();
 }
 
+// ---------- Loop ----------
 void loop() {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi disconnect ho gaya, dobara connect kar rahe hain...");
+    safePrintf("WiFi disconnect ho gaya, dobara connect kar rahe hain...\n");
     connectWiFi();
   }
 
