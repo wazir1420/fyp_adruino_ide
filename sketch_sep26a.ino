@@ -36,6 +36,8 @@ const unsigned long READ_INTERVAL_MS = 2000;
 unsigned long lastHistoryWriteTime = 0;
 const unsigned long HISTORY_INTERVAL_MS = 60000;
 
+int lastLoggedHour = -1;   // hourly logging tracker (NEW)
+
 // Last-good values
 float lastCurrent = 0, lastPower = 0, lastFreq = 50.0, lastPF = 0, lastEnergy = 0;
 
@@ -225,6 +227,33 @@ void sendHistoryToFirebase(float energyKwh) {
   firebasePut(url, String(energyKwh, 2), "history", 3);
 }
 
+// ---------- Hourly logging (NEW) ----------
+// Har ghanta /meters/meter1/hourly/YYYY-MM-DD/{hour} par CUMULATIVE kWh
+// likhta hai — app khud deltas nikaal kar per-hour kWh banati hai.
+void sendHourlyToFirebase(float energyKwh) {
+  time_t now = time(nullptr);
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+
+  // Har ghanta sirf ek dafa log hota hai
+  if (timeinfo.tm_hour == lastLoggedHour) return;
+  lastLoggedHour = timeinfo.tm_hour;
+
+  // Pichla (poora hua) ghanta likho — abhi wala adhoora hai
+  struct tm prev = timeinfo;
+  prev.tm_hour -= 1;
+  mktime(&prev);  // normalize — raat 12:00 cross bhi theek
+
+  char dayBuf[11];
+  snprintf(dayBuf, sizeof(dayBuf), "%04d-%02d-%02d",
+           prev.tm_year + 1900, prev.tm_mon + 1, prev.tm_mday);
+
+  String url = String(FIREBASE_DB_URL) + "/meters/" + METER_ID +
+             "/hourly/" + String(dayBuf) + "/h" + String(prev.tm_hour) + ".json";
+
+  firebasePut(url, String(energyKwh, 2), "hourly", 3);
+}
+
 // ---------- Main read + send (original delays preserved) ----------
 void updateAndSendReadings() {
   const uint16_t REG_VOLTAGE_L1        = 0x5B00;
@@ -278,6 +307,8 @@ void updateAndSendReadings() {
     lastHistoryWriteTime = millis();
     sendHistoryToFirebase(lastEnergy);
   }
+
+  sendHourlyToFirebase(lastEnergy);   // NEW
 }
 
 // ---------- Setup ----------
