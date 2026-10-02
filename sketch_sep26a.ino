@@ -24,6 +24,35 @@ const char* METER_NAME = "ABB B24";
 #define RXD2               16
 #define TXD2               17
 
+// ================= NEW RELAY: device control config =================
+// Active-LOW relay module: LOW = ON, HIGH = OFF
+#define RELAY_ON   LOW
+#define RELAY_OFF  HIGH
+
+struct Device {
+  const char* id;            // Firebase key: devices/<id>
+  uint8_t     pin;           // ESP32 GPIO -> relay IN
+  float       ratedWatts;    // ESTIMATED consumption when ON (no sensor)
+  unsigned long minOffMs;    // compressor protection (0 = none)
+  bool        on;            // current relay state
+  unsigned long offSince;    // millis() when last turned OFF (0 = never)
+  unsigned long lastWrite;   // last status write-back time
+};
+
+Device devices[] = {
+  // id       pin  watts  minOff        on     offSince lastWrite
+  {"bulb",    25,  10.0,  0,            false, 0,       0},
+  {"fan",     26,  60.0,  0,            false, 0,       0},
+  {"fridge",  27,  150.0, 5UL*60*1000,  false, 0,       0},
+  {"spare",   32,  0.0,   0,            false, 0,       0},
+};
+const int NUM_DEVICES = sizeof(devices) / sizeof(devices[0]);
+
+unsigned long lastCmdPoll = 0;
+const unsigned long CMD_POLL_INTERVAL_MS = 1500;
+const unsigned long HEARTBEAT_MS = 10000;   // status refresh even without change
+// =====================================================================
+
 ModbusMaster node;
 WiFiClientSecure secureClient;
 
@@ -36,12 +65,12 @@ const unsigned long READ_INTERVAL_MS = 2000;
 unsigned long lastHistoryWriteTime = 0;
 const unsigned long HISTORY_INTERVAL_MS = 60000;
 
-int lastLoggedHour = -1;   // hourly logging tracker (NEW)
+int lastLoggedHour = -1;
 
 // Last-good values
 float lastCurrent = 0, lastPower = 0, lastFreq = 50.0, lastPF = 0, lastEnergy = 0;
 
-// ---------- Print task: runs on Core 0, isolated from Modbus ----------
+// ---------- Print task ----------
 void printTask(void *pvParameters) {
   char* msg;
   for (;;) {
@@ -53,7 +82,6 @@ void printTask(void *pvParameters) {
   }
 }
 
-// ---------- safePrintf: queues the message instead of printing directly ----------
 void safePrintf(const char* fmt, ...) {
   if (printQueue == NULL) return;
   char* buf = (char*)malloc(256);
@@ -63,7 +91,7 @@ void safePrintf(const char* fmt, ...) {
   vsnprintf(buf, 256, fmt, args);
   va_end(args);
   if (xQueueSend(printQueue, &buf, 0) != pdTRUE) {
-    free(buf);   // queue full, drop the message
+    free(buf);
   }
 }
 
@@ -74,10 +102,8 @@ void preTransmission() {
 }
 
 void postTransmission() {
-  // Bounded flush so we never block forever on Serial2
   unsigned long t = millis();
   while (Serial2.availableForWrite() < 64 && (millis() - t) < 50) {
-    // wait max 50ms
   }
   delayMicroseconds(100);
   digitalWrite(RS485_DE_RE_PIN, LOW);
@@ -167,7 +193,7 @@ uint64_t read64(uint16_t startReg, bool &ok) {
   return 0;
 }
 
-// ---------- Firebase helper ----------
+// ---------- Firebase helper (PUT) ----------
 bool firebasePut(const String& url, const String& body, const char* tag, int maxAttempts) {
   for (int attempt = 1; attempt <= maxAttempts; attempt++) {
     if (WiFi.status() != WL_CONNECTED) return false;
@@ -198,6 +224,99 @@ bool firebasePut(const String& url, const String& body, const char* tag, int max
   return false;
 }
 
+// ================= NEW RELAY: GET + PATCH helpers =================
+bool firebaseGet(const String& url, String& out) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  secureClient.stop();
+  HTTPClient http;
+  http.setReuse(false);
+  http.setConnectTimeout(3000);
+  http.setTimeout(4000);
+  if (!http.begin(secureClient, url)) return false;
+  int code = http.GET();
+  if (code == 200) out = http.getString();
+  http.end();
+  if (code != 200) {
+    safePrintf("Firebase GET failed: %d (%s)\n", code, HTTPClient::errorToString(code).c_str());
+    return false;
+  }
+  return true;
+}
+
+bool firebasePatch(const String& url, const String& body) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  secureClient.stop();
+  HTTPClient http;
+  http.setReuse(false);
+  http.setConnectTimeout(3000);
+  http.setTimeout(4000);
+  if (!http.begin(secureClient, url)) return false;
+  http.addHeader("Content-Type", "application/json");
+  int code = http.PATCH(body);
+  http.end();
+  return code == 200;
+}
+
+// payload: {"bulb":{"applied":true,"state":true,...},"fan":{...}}
+// Firebase flat objects hain (nested nahi), isliye '}' tak substring kaafi hai.
+bool parseState(const String& payload, const char* id, bool &state) {
+  String key = "\"" + String(id) + "\":{";
+  int i = payload.indexOf(key);
+  if (i < 0) return false;
+  int e = payload.indexOf('}', i);
+  if (e < 0) return false;
+  String obj = payload.substring(i, e);
+  if (obj.indexOf("\"state\":true") >= 0)  { state = true;  return true; }
+  if (obj.indexOf("\"state\":false") >= 0) { state = false; return true; }
+  return false;
+}
+
+// App ko batao: relay ka actual state, estimated power, server timestamp
+void writeDeviceStatus(Device &d) {
+  String url = String(FIREBASE_DB_URL) + "/devices/" + d.id + ".json";
+  String body = "{\"applied\":" + String(d.on ? "true" : "false") +
+                ",\"power\":" + String(d.on ? d.ratedWatts : 0.0, 1) +
+                ",\"lastUpdate\":{\".sv\":\"timestamp\"}}";
+  if (firebasePatch(url, body)) d.lastWrite = millis();
+}
+
+void setRelay(Device &d, bool on) {
+  digitalWrite(d.pin, on ? RELAY_ON : RELAY_OFF);
+  if (d.on && !on) d.offSince = millis();
+  d.on = on;
+  safePrintf("Relay %s (GPIO%d) -> %s\n", d.id, d.pin, on ? "ON" : "OFF");
+}
+
+void pollCommands() {
+  String payload;
+  String url = String(FIREBASE_DB_URL) + "/devices.json";
+  if (!firebaseGet(url, payload)) return;   // fail ho to current state barqarar rakho
+  if (payload == "null") return;
+
+  for (int i = 0; i < NUM_DEVICES; i++) {
+    Device &d = devices[i];
+    bool want;
+    if (!parseState(payload, d.id, want)) continue;
+
+    if (want != d.on) {
+      // Compressor protection: OFF ke baad minOff tak ON nahi
+      if (want && d.minOffMs > 0 && d.offSince > 0 &&
+          (millis() - d.offSince) < d.minOffMs) {
+        unsigned long left = (d.minOffMs - (millis() - d.offSince)) / 1000;
+        safePrintf("%s: compressor guard, %lus baqi\n", d.id, left);
+        // applied false rehta hai -> app mein "waiting" dikhega
+        if (millis() - d.lastWrite >= HEARTBEAT_MS) writeDeviceStatus(d);
+        continue;
+      }
+      setRelay(d, want);
+      writeDeviceStatus(d);
+    } else if (millis() - d.lastWrite >= HEARTBEAT_MS) {
+      writeDeviceStatus(d);   // heartbeat
+    }
+  }
+}
+// ==================================================================
+
 void sendMeterName() {
   String url = String(FIREBASE_DB_URL) + "/meters/" + METER_ID + "/name.json";
   String json = "\"" + String(METER_NAME) + "\"";
@@ -227,22 +346,17 @@ void sendHistoryToFirebase(float energyKwh) {
   firebasePut(url, String(energyKwh, 2), "history", 3);
 }
 
-// ---------- Hourly logging (NEW) ----------
-// Har ghanta /meters/meter1/hourly/YYYY-MM-DD/{hour} par CUMULATIVE kWh
-// likhta hai — app khud deltas nikaal kar per-hour kWh banati hai.
 void sendHourlyToFirebase(float energyKwh) {
   time_t now = time(nullptr);
   struct tm timeinfo;
   localtime_r(&now, &timeinfo);
 
-  // Har ghanta sirf ek dafa log hota hai
   if (timeinfo.tm_hour == lastLoggedHour) return;
   lastLoggedHour = timeinfo.tm_hour;
 
-  // Pichla (poora hua) ghanta likho — abhi wala adhoora hai
   struct tm prev = timeinfo;
   prev.tm_hour -= 1;
-  mktime(&prev);  // normalize — raat 12:00 cross bhi theek
+  mktime(&prev);
 
   char dayBuf[11];
   snprintf(dayBuf, sizeof(dayBuf), "%04d-%02d-%02d",
@@ -254,7 +368,7 @@ void sendHourlyToFirebase(float energyKwh) {
   firebasePut(url, String(energyKwh, 2), "hourly", 3);
 }
 
-// ---------- Main read + send (original delays preserved) ----------
+// ---------- Main read + send (original) ----------
 void updateAndSendReadings() {
   const uint16_t REG_VOLTAGE_L1        = 0x5B00;
   const uint16_t REG_CURRENT_L1        = 0x5B0C;
@@ -308,15 +422,21 @@ void updateAndSendReadings() {
     sendHistoryToFirebase(lastEnergy);
   }
 
-  sendHourlyToFirebase(lastEnergy);   // NEW
+  sendHourlyToFirebase(lastEnergy);
 }
 
 // ---------- Setup ----------
 void setup() {
+  // NEW RELAY: sabse pehle relays OFF karo (active-LOW => HIGH), boot pe click na ho
+  for (int i = 0; i < NUM_DEVICES; i++) {
+    digitalWrite(devices[i].pin, RELAY_OFF);
+    pinMode(devices[i].pin, OUTPUT);
+    digitalWrite(devices[i].pin, RELAY_OFF);
+  }
+
   Serial.begin(115200);
   delay(1000);
 
-  // ---- Print queue + PrintTask on Core 0 (fixes garbage) ----
   printQueue = xQueueCreate(30, sizeof(char*));
   xTaskCreatePinnedToCore(printTask, "PrintTask", 4096, NULL, 1, NULL, 0);
 
@@ -336,7 +456,7 @@ void setup() {
   node.preTransmission(preTransmission);
   node.postTransmission(postTransmission);
 
-  Serial.println("Setup complete. Meter data Firebase ko bhejna shuru...");
+  Serial.println("Setup complete. Meter data + relay control shuru...");
   Serial.flush();
 }
 
@@ -345,6 +465,12 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     safePrintf("WiFi disconnect ho gaya, dobara connect kar rahe hain...\n");
     connectWiFi();
+  }
+
+  // NEW RELAY: command poll
+  if (millis() - lastCmdPoll >= CMD_POLL_INTERVAL_MS) {
+    lastCmdPoll = millis();
+    pollCommands();
   }
 
   if (millis() - lastReadTime >= READ_INTERVAL_MS) {
