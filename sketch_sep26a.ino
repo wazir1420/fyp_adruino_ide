@@ -5,6 +5,8 @@
 #include <time.h>
 
 // ---------- WiFi CONFIG ----------
+// NOTE: apna asal naam aur password yahan daalein. Code share karne se pehle
+// inhein dobara "xxxx" kar dein.
 const char* WIFI_SSID     = "Wazir";
 const char* WIFI_PASSWORD = "wazir@1420";
 
@@ -24,39 +26,47 @@ const char* METER_NAME = "ABB B24";
 #define RXD2               16
 #define TXD2               17
 
-// ================= NEW RELAY: device control config =================
+// ================= RELAY: device control config =================
 // Active-LOW relay module: LOW = ON, HIGH = OFF
 #define RELAY_ON   LOW
 #define RELAY_OFF  HIGH
 
 struct Device {
-  const char* id;            // Firebase key: devices/<id>
+  const char* id;            // Firebase key: meters/<METER_ID>/devices/<id>
   uint8_t     pin;           // ESP32 GPIO -> relay IN
   float       ratedWatts;    // ESTIMATED consumption when ON (no sensor)
   unsigned long minOffMs;    // compressor protection (0 = none)
   bool        on;            // current relay state
   unsigned long offSince;    // millis() when last turned OFF (0 = never)
-  unsigned long lastWrite;   // last status write-back time
 };
 
 Device devices[] = {
-  // id       pin  watts  minOff        on     offSince lastWrite
-  {"bulb",    25,  10.0,  0,            false, 0,       0},
-  {"fan",     26,  60.0,  0,            false, 0,       0},
-  {"fridge",  27,  150.0, 5UL*60*1000,  false, 0,       0},
-  {"spare",   32,  0.0,   0,            false, 0,       0},
+  // id       pin  watts  minOff        on     offSince
+  {"bulb",    25,  10.0,  0,            false, 0},
+  {"fan",     26,  60.0,  0,            false, 0},
+  {"fridge",  27,  150.0, 5UL*60*1000,  false, 0},
+  {"spare",   32,  0.0,   0,            false, 0},
 };
 const int NUM_DEVICES = sizeof(devices) / sizeof(devices[0]);
 
-unsigned long lastCmdPoll = 0;
-const unsigned long CMD_POLL_INTERVAL_MS = 1500;
-const unsigned long HEARTBEAT_MS = 10000;   // status refresh even without change
+// Control task kitni jaldi command check kare (ms). Kam = tez jawab.
+const unsigned long CMD_POLL_INTERVAL_MS = 600;
+// Status (applied/power/lastUpdate) bina change ke bhi is dauran likhna
+const unsigned long HEARTBEAT_MS = 10000;
+// true  = ESP32 chalu hote hi sab commands "off" kar deta hai (bijli aane par
+//         koi load achanak nahi chalta).
+// false = Firebase mein jo "state" pari hai, wahi dobara lagu ho jati hai.
+const bool RESET_COMMANDS_ON_BOOT = true;
+// Heap is se kam ho jaye to control ka connection band karke dobara banta hai.
+const uint32_t MIN_FREE_HEAP = 30000;
 // =====================================================================
 
 ModbusMaster node;
-WiFiClientSecure secureClient;
+WiFiClientSecure secureClient;     // sirf monitoring ke liye (loop)
+WiFiClientSecure ctrlClient;       // sirf control task ke liye
+HTTPClient       ctrlHttp;         // connection reuse ke liye global
 
-// ---------- Print queue (garbage fix) ----------
+// ---------- Print queue ----------
 QueueHandle_t printQueue = NULL;
 
 unsigned long lastReadTime = 0;
@@ -193,7 +203,7 @@ uint64_t read64(uint16_t startReg, bool &ok) {
   return 0;
 }
 
-// ---------- Firebase helper (PUT) ----------
+// ---------- Firebase helper (PUT) — monitoring ke liye, pehle jaisa ----------
 bool firebasePut(const String& url, const String& body, const char* tag, int maxAttempts) {
   for (int attempt = 1; attempt <= maxAttempts; attempt++) {
     if (WiFi.status() != WL_CONNECTED) return false;
@@ -224,60 +234,100 @@ bool firebasePut(const String& url, const String& body, const char* tag, int max
   return false;
 }
 
-// ================= NEW RELAY: GET + PATCH helpers =================
-bool firebaseGet(const String& url, String& out) {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  secureClient.stop();
-  HTTPClient http;
-  http.setReuse(false);
-  http.setConnectTimeout(3000);
-  http.setTimeout(4000);
-  if (!http.begin(secureClient, url)) return false;
-  int code = http.GET();
-  if (code == 200) out = http.getString();
-  http.end();
-  if (code != 200) {
-    safePrintf("Firebase GET failed: %d (%s)\n", code, HTTPClient::errorToString(code).c_str());
-    return false;
+// =====================================================================
+//                    RELAY CONTROL (alag FreeRTOS task)
+// =====================================================================
+// Firebase path: /meters/<METER_ID>/devices/<id>
+//   state       (app likhti hai)   : true/false = chahiye on/off
+//   applied     (ESP32 likhta hai) : relay ki asal halat
+//   power       (ESP32 likhta hai) : andaza (W)
+//   lastUpdate  (ESP32 likhta hai) : server timestamp
+
+String devicesUrl() {
+  return String(FIREBASE_DB_URL) + "/meters/" + METER_ID + "/devices.json";
+}
+
+// Control ka apna connection: khula rehta hai (TLS handshake baar baar nahi).
+// Fail ho to connection band karke ek dafa dobara koshish karta hai.
+bool ctrlRequest(bool isPatch, const String& url, const String& body, String* out) {
+  for (int attempt = 1; attempt <= 2; attempt++) {
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    ctrlHttp.setReuse(true);
+    ctrlHttp.setConnectTimeout(2500);
+    ctrlHttp.setTimeout(2500);
+    if (!ctrlHttp.begin(ctrlClient, url)) {
+      ctrlClient.stop();
+      continue;
+    }
+
+    int code;
+    if (isPatch) {
+      ctrlHttp.addHeader("Content-Type", "application/json");
+      code = ctrlHttp.PATCH(body);
+    } else {
+      code = ctrlHttp.GET();
+    }
+
+    if (code == 200) {
+      if (out) *out = ctrlHttp.getString();
+      ctrlHttp.end();            // reuse=true => connection khula rehta hai
+      return true;
+    }
+
+    safePrintf("Control %s failed: %d (%s) try %d\n", isPatch ? "PATCH" : "GET",
+               code, HTTPClient::errorToString(code).c_str(), attempt);
+    ctrlHttp.end();
+    ctrlClient.stop();           // purana/band connection chhor kar naya banao
   }
-  return true;
-}
-
-bool firebasePatch(const String& url, const String& body) {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  secureClient.stop();
-  HTTPClient http;
-  http.setReuse(false);
-  http.setConnectTimeout(3000);
-  http.setTimeout(4000);
-  if (!http.begin(secureClient, url)) return false;
-  http.addHeader("Content-Type", "application/json");
-  int code = http.PATCH(body);
-  http.end();
-  return code == 200;
-}
-
-// payload: {"bulb":{"applied":true,"state":true,...},"fan":{...}}
-// Firebase flat objects hain (nested nahi), isliye '}' tak substring kaafi hai.
-bool parseState(const String& payload, const char* id, bool &state) {
-  String key = "\"" + String(id) + "\":{";
-  int i = payload.indexOf(key);
-  if (i < 0) return false;
-  int e = payload.indexOf('}', i);
-  if (e < 0) return false;
-  String obj = payload.substring(i, e);
-  if (obj.indexOf("\"state\":true") >= 0)  { state = true;  return true; }
-  if (obj.indexOf("\"state\":false") >= 0) { state = false; return true; }
   return false;
 }
 
-// App ko batao: relay ka actual state, estimated power, server timestamp
-void writeDeviceStatus(Device &d) {
-  String url = String(FIREBASE_DB_URL) + "/devices/" + d.id + ".json";
-  String body = "{\"applied\":" + String(d.on ? "true" : "false") +
-                ",\"power\":" + String(d.on ? d.ratedWatts : 0.0, 1) +
-                ",\"lastUpdate\":{\".sv\":\"timestamp\"}}";
-  if (firebasePatch(url, body)) d.lastWrite = millis();
+// payload: {"bulb":{"applied":true,"lastUpdate":123,"power":10,"state":true},"fan":{...}}
+// "id" ka object dhoondta hai (agle device ke object tak), us mein "state" parhta hai.
+bool parseState(const String& payload, const char* id, bool &state) {
+  String key = "\"" + String(id) + "\":{";
+  int start = payload.indexOf(key);
+  if (start < 0) return false;
+
+  int end = payload.length();
+  for (int j = 0; j < NUM_DEVICES; j++) {
+    if (strcmp(devices[j].id, id) == 0) continue;
+    String other = "\"" + String(devices[j].id) + "\":{";
+    int p = payload.indexOf(other, start + key.length());
+    if (p >= 0 && p < end) end = p;
+  }
+
+  int s = payload.indexOf("\"state\":", start);
+  if (s < 0 || s >= end) return false;
+  String v = payload.substring(s + 8, s + 13);
+  if (v.startsWith("true"))  { state = true;  return true; }
+  if (v.startsWith("false")) { state = false; return true; }
+  return false;
+}
+
+// Sab devices ka status ek hi PATCH mein (multi-path update): ek request, ek dafa.
+String buildStatusBody(bool alsoResetState) {
+  String b = "{";
+  for (int i = 0; i < NUM_DEVICES; i++) {
+    Device &d = devices[i];
+    if (i) b += ",";
+    String id = String(d.id);
+    if (alsoResetState) b += "\"" + id + "/state\":false,";
+    b += "\"" + id + "/applied\":" + (d.on ? "true" : "false");
+    b += ",\"" + id + "/power\":" + String(d.on ? d.ratedWatts : 0.0, 1);
+    b += ",\"" + id + "/lastUpdate\":{\".sv\":\"timestamp\"}";
+  }
+  b += "}";
+  return b;
+}
+
+unsigned long lastStatusWrite = 0;
+
+bool writeAllStatus(bool alsoResetState) {
+  bool ok = ctrlRequest(true, devicesUrl(), buildStatusBody(alsoResetState), nullptr);
+  if (ok) lastStatusWrite = millis();
+  return ok;
 }
 
 void setRelay(Device &d, bool on) {
@@ -289,33 +339,62 @@ void setRelay(Device &d, bool on) {
 
 void pollCommands() {
   String payload;
-  String url = String(FIREBASE_DB_URL) + "/devices.json";
-  if (!firebaseGet(url, payload)) return;   // fail ho to current state barqarar rakho
+  if (!ctrlRequest(false, devicesUrl(), "", &payload)) return;  // fail => halat wahi
   if (payload == "null") return;
+
+  bool changed = false;
 
   for (int i = 0; i < NUM_DEVICES; i++) {
     Device &d = devices[i];
     bool want;
     if (!parseState(payload, d.id, want)) continue;
+    if (want == d.on) continue;
 
-    if (want != d.on) {
-      // Compressor protection: OFF ke baad minOff tak ON nahi
-      if (want && d.minOffMs > 0 && d.offSince > 0 &&
-          (millis() - d.offSince) < d.minOffMs) {
-        unsigned long left = (d.minOffMs - (millis() - d.offSince)) / 1000;
-        safePrintf("%s: compressor guard, %lus baqi\n", d.id, left);
-        // applied false rehta hai -> app mein "waiting" dikhega
-        if (millis() - d.lastWrite >= HEARTBEAT_MS) writeDeviceStatus(d);
-        continue;
-      }
-      setRelay(d, want);
-      writeDeviceStatus(d);
-    } else if (millis() - d.lastWrite >= HEARTBEAT_MS) {
-      writeDeviceStatus(d);   // heartbeat
+    // Compressor protection: OFF ke baad minOff tak ON nahi
+    if (want && d.minOffMs > 0 && d.offSince > 0 &&
+        (millis() - d.offSince) < d.minOffMs) {
+      unsigned long left = (d.minOffMs - (millis() - d.offSince)) / 1000;
+      safePrintf("%s: compressor guard, %lus baqi\n", d.id, left);
+      continue;     // applied false rehta hai => app mein "waiting"
     }
+
+    setRelay(d, want);   // pehle relay chalao, phir status likho
+    changed = true;
+  }
+
+  if (changed || millis() - lastStatusWrite >= HEARTBEAT_MS) {
+    writeAllStatus(false);
   }
 }
-// ==================================================================
+
+void controlTask(void *pvParameters) {
+  ctrlClient.setInsecure();
+
+  // Boot par sab relays pehle se OFF hain. Firebase mein purani "state: true"
+  // pari ho to usay bhi false kar dein, taake bijli aane par load na chalein.
+  if (RESET_COMMANDS_ON_BOOT) {
+    while (!writeAllStatus(true)) {
+      vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+    safePrintf("Control: boot par sab commands off kar diye\n");
+  }
+
+  for (;;) {
+    if (WiFi.status() != WL_CONNECTED) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+
+    if (ESP.getFreeHeap() < MIN_FREE_HEAP) {
+      safePrintf("Control: heap kam (%u), connection reset\n", ESP.getFreeHeap());
+      ctrlClient.stop();
+    }
+
+    pollCommands();
+    vTaskDelay(pdMS_TO_TICKS(CMD_POLL_INTERVAL_MS));
+  }
+}
+// =====================================================================
 
 void sendMeterName() {
   String url = String(FIREBASE_DB_URL) + "/meters/" + METER_ID + "/name.json";
@@ -427,7 +506,7 @@ void updateAndSendReadings() {
 
 // ---------- Setup ----------
 void setup() {
-  // NEW RELAY: sabse pehle relays OFF karo (active-LOW => HIGH), boot pe click na ho
+  // Sabse pehle relays OFF karo (active-LOW => HIGH), boot par click na ho
   for (int i = 0; i < NUM_DEVICES; i++) {
     digitalWrite(devices[i].pin, RELAY_OFF);
     pinMode(devices[i].pin, OUTPUT);
@@ -456,21 +535,18 @@ void setup() {
   node.preTransmission(preTransmission);
   node.postTransmission(postTransmission);
 
+  // Relay control alag task mein (Core 0): monitoring ke delay isay nahi rokte.
+  xTaskCreatePinnedToCore(controlTask, "ControlTask", 10240, NULL, 2, NULL, 0);
+
   Serial.println("Setup complete. Meter data + relay control shuru...");
   Serial.flush();
 }
 
-// ---------- Loop ----------
+// ---------- Loop (sirf monitoring) ----------
 void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     safePrintf("WiFi disconnect ho gaya, dobara connect kar rahe hain...\n");
     connectWiFi();
-  }
-
-  // NEW RELAY: command poll
-  if (millis() - lastCmdPoll >= CMD_POLL_INTERVAL_MS) {
-    lastCmdPoll = millis();
-    pollCommands();
   }
 
   if (millis() - lastReadTime >= READ_INTERVAL_MS) {
